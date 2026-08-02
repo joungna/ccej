@@ -13,7 +13,7 @@
 <!-- Lucide icons -->
 <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
 
-<link rel="stylesheet" href="./assets/style.css">
+<link rel="stylesheet" href="./assets/style.css?v=2">
 </head>
 <body class="bg-gray-50 text-gray-900 antialiased">
 
@@ -143,7 +143,8 @@
 
       <!-- legend -->
       <div class="hidden lg:block absolute left-4 bottom-4 bg-white/90 backdrop-blur border border-gray-200 rounded-xl px-3 py-2.5 text-[11px] text-gray-600 shadow-sm space-y-1">
-        <div class="font-semibold text-gray-800 mb-1">카테고리</div>
+        <div class="text-gray-500 mb-1.5 leading-relaxed">점 하나 = 글 하나 · 점 속 = 대표 사진<br>크기 = 글 분량 · 선 = 태그로 연결된 관련 글</div>
+        <div class="font-semibold text-gray-800 mb-1">카테고리 (테두리 색)</div>
         <div class="grid grid-cols-2 gap-x-3 gap-y-1">
           <span class="flex items-center gap-1.5"><i class="inline-block w-2 h-2 rounded-full" style="background:#3b82f6"></i>정치</span>
           <span class="flex items-center gap-1.5"><i class="inline-block w-2 h-2 rounded-full" style="background:#10b981"></i>경제</span>
@@ -159,7 +160,7 @@
       </div>
 
       <div class="hidden md:flex absolute right-4 bottom-4 items-center gap-1.5 bg-white/90 backdrop-blur border border-gray-200 rounded-full px-3 py-1.5 text-[11px] text-gray-500 shadow-sm">
-        <i data-lucide="mouse" class="w-3.5 h-3.5"></i> 휠 줌 · 드래그 이동 · 더블클릭 확대
+        <i data-lucide="mouse" class="w-3.5 h-3.5"></i> 휠 줌 · 배경 드래그 이동 · 점 드래그 재배치 · 클릭 상세
       </div>
 
       <!-- Loading overlay -->
@@ -199,7 +200,7 @@
 
 <div id="tooltip" style="opacity:0"></div>
 
-<script src="./assets/app.js"></script>
+<script src="./assets/app.js?v=2"></script>
 <script>
   // Ensure freshly-created Lucide icons (e.g. in dynamic panels) render.
   window.addEventListener("load", () => { if (window.lucide) lucide.createIcons(); });
