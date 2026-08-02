@@ -1,10 +1,14 @@
 /* =========================================================================
-   CCEJ Press Knowledge Map
-   Vanilla JS + D3 v7 force simulation knowledge map.
-   Data: ./data/search-index.json (fast initial paint)
-         ./data/posts.json        (lazy-loaded, cached, used for detail panel
-                                    and to enrich node metadata once ready)
-         ./data/months.json, ./data/tags.json (UI chips / filters)
+   CCEJ Press Knowledge Map — Network Edition
+   Vanilla JS + D3 v7 force-directed network.
+   - 모든 글이 하나의 공간에 산포 (월별 클러스터 제거)
+   - 점 속에 대표 사진 (images.weserv.nl 썸네일 프록시, 실패 시 원본 → 색상)
+   - 점 크기 = 본문 길이 비례
+   - 태그 유사도(IDF 가중) 기반 링크로 연결, 지속적으로 살아 움직이는 시뮬레이션
+   Data: ./data/search-index.json  (초기 노드)
+         ./data/thumbs.json        (id → [대표이미지, 본문길이])
+         ./data/posts.json         (상세 패널용, 지연 로드)
+         ./data/months.json, ./data/tags.json (칩/필터)
    ========================================================================= */
 
 (() => {
@@ -30,37 +34,28 @@
 
   const TYPE_ORDER = ["동영상", "이미지", "첨부파일", "보고서", "행사", "공지", "텍스트"];
   const TYPE_ICON = {
-    "동영상": "🎬",
-    "이미지": "🖼",
-    "첨부파일": "📎",
-    "보고서": "📄",
-    "행사": "📅",
-    "공지": "📢",
-    "텍스트": "📝",
-  };
-  const TYPE_LUCIDE = {
-    "동영상": "video",
-    "이미지": "image",
-    "첨부파일": "paperclip",
-    "보고서": "file-text",
-    "행사": "calendar",
-    "공지": "megaphone",
-    "텍스트": "file",
+    "동영상": "🎬", "이미지": "🖼", "첨부파일": "📎", "보고서": "📄",
+    "행사": "📅", "공지": "📢", "텍스트": "📝",
   };
   const ALL_TYPES = ["첨부파일", "이미지", "동영상", "행사", "공지", "보고서", "텍스트"];
 
-  const WORLD_W = 2200;
-  const WORLD_H = 1400;
+  const WORLD_W = 2600;
+  const WORLD_H = 1700;
+
+  // 링크 생성 파라미터
+  const EDGE_TAG_MAX_COUNT = 70;   // 이보다 흔한 태그는 쌍 생성에서 제외(허브 폭발 방지)
+  const EDGES_PER_NODE = 3;        // 노드당 유지할 최대 링크 수 (유사도 상위)
 
   /* ------------------------------- State --------------------------------- */
 
   const state = {
     nodes: [],
+    edges: [],
+    adjacency: new Map(), // id -> Set(neighbor id)
     nodeById: new Map(),
-    anchors: {},
     monthsMeta: null,
     tagsMeta: null,
-    postsCache: null, // Map id -> full post, set once posts.json resolves
+    postsCache: null,
     postsPromise: null,
     postsLoaded: false,
     maxBodyLen: 300,
@@ -76,19 +71,20 @@
     },
     searchQuery: "",
     selectedId: null,
+    hoverId: null,
     currentTransform: null,
     listBatchSize: 24,
     listRendered: 0,
     listItems: [],
   };
 
-  let simulation, svg, zoomLayer, nodesLayer, zoomBehavior, dragBehavior;
+  let simulation, svg, zoomLayer, linksLayer, nodesLayer, zoomBehavior, dragBehavior;
+  let linkSel = null;
 
   /* ------------------------------ DOM refs -------------------------------- */
 
   const $ = (sel) => document.querySelector(sel);
   const el = {
-    svg: null,
     tooltip: () => $("#tooltip"),
     searchInput: () => $("#search-input"),
     monthChips: () => $("#month-chips"),
@@ -147,14 +143,16 @@
     return typeArr[0];
   }
 
-  function fmtDate(d) {
-    if (!d) return "";
-    return d;
+  // 대표 이미지 → 정사각 썸네일 프록시 URL
+  function thumbUrl(u, size) {
+    if (!u) return "";
+    const clean = u.replace(/^https?:\/\//, "");
+    return "https://images.weserv.nl/?url=" + encodeURIComponent(clean) +
+      "&w=" + size + "&h=" + size + "&fit=cover&output=webp&q=75";
   }
 
   function bodyToHtml(body) {
     if (!body) return "<p class='text-gray-400'>본문이 없습니다.</p>";
-    // Minimal markdown-ish rendering: headings, line breaks, paragraphs
     const escaped = escapeHtml(body);
     const lines = escaped.split(/\n/);
     let html = "";
@@ -193,10 +191,12 @@
   }
 
   function buildNodesFromSearchIndex(list) {
-    const nodes = list.map((item) => {
+    return list.map((item) => {
       const category = normalizeCategory(item.category);
       const month = (item.date || "").slice(0, 7);
-      const excerptLen = (item.body_excerpt || "").length;
+      // 초기 위치: 중앙 타원 내 랜덤 산포
+      const a = Math.random() * Math.PI * 2;
+      const rr = Math.sqrt(Math.random());
       return {
         id: item.id,
         title: item.title || "(제목 없음)",
@@ -207,39 +207,44 @@
         category,
         tags: item.tags || [],
         excerpt: item.body_excerpt || "",
-        // enriched later once posts.json resolves
+        img: "",
         type: [],
         typeIcon: "텍스트",
         viewCount: 0,
-        bodyLen: excerptLen,
+        bodyLen: (item.body_excerpt || "").length,
         hasImage: false,
         hasAttachment: false,
         hasVideo: false,
         enriched: false,
-        // sim state
-        x: WORLD_W / 2 + (Math.random() - 0.5) * 40,
-        y: WORLD_H / 2 + (Math.random() - 0.5) * 40,
+        x: WORLD_W / 2 + Math.cos(a) * rr * WORLD_W * 0.33,
+        y: WORLD_H / 2 + Math.sin(a) * rr * WORLD_H * 0.33,
       };
     });
-    return nodes;
+  }
+
+  // thumbs.json: { id: [imgUrl, bodyLen] }
+  function applyThumbs(thumbs) {
+    let maxLen = 300;
+    for (const n of state.nodes) {
+      const t = thumbs[n.id];
+      if (!t) continue;
+      n.img = t[0] || "";
+      n.bodyLen = t[1] || n.bodyLen;
+      if (n.bodyLen > maxLen) maxLen = n.bodyLen;
+    }
+    state.maxBodyLen = maxLen;
   }
 
   function enrichNodesWithPosts(postsArr) {
     const map = new Map();
-    let maxLen = 300;
-    for (const p of postsArr) {
-      map.set(p.id, p);
-      if (p.body) maxLen = Math.max(maxLen, p.body.length);
-    }
+    for (const p of postsArr) map.set(p.id, p);
     state.postsCache = map;
-    state.maxBodyLen = maxLen;
     for (const n of state.nodes) {
       const p = map.get(n.id);
       if (!p) continue;
       n.type = p.type || [];
       n.typeIcon = pickTypeIcon(p.type);
       n.viewCount = p.view_count || 0;
-      n.bodyLen = (p.body || "").length || n.bodyLen;
       n.hasImage = Array.isArray(p.images) && p.images.length > 0;
       n.hasAttachment = Array.isArray(p.attachments) && p.attachments.length > 0;
       n.hasVideo = Array.isArray(p.video_urls) && p.video_urls.length > 0;
@@ -247,59 +252,128 @@
     }
   }
 
-  /* ------------------------------ Layout / anchors ------------------------------ */
+  /* ------------------------------ Edges (태그 유사도) ------------------------------ */
 
-  function computeAnchors(monthsList) {
-    const anchors = {};
-    const n = monthsList.length;
-    const cols = Math.ceil(Math.sqrt(n * (WORLD_W / WORLD_H)));
-    const rows = Math.ceil(n / cols);
-    const cellW = WORLD_W / cols;
-    const cellH = WORLD_H / rows;
-    monthsList.forEach((m, i) => {
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-      anchors[m] = {
-        x: cellW * (col + 0.5),
-        y: cellH * (row + 0.5),
-      };
+  function buildEdges() {
+    const nodes = state.nodes;
+    const tagCount = {};
+    nodes.forEach((n) => n.tags.forEach((t) => { tagCount[t] = (tagCount[t] || 0) + 1; }));
+
+    // 태그 → 노드 인덱스 역색인 (너무 흔한 태그 제외)
+    const idx = {};
+    nodes.forEach((n, i) => {
+      n.tags.forEach((t) => {
+        if (tagCount[t] >= 2 && tagCount[t] <= EDGE_TAG_MAX_COUNT) {
+          (idx[t] = idx[t] || []).push(i);
+        }
+      });
     });
-    return anchors;
+
+    // 쌍별 유사도 점수: 공유 태그의 IDF 가중 합
+    const score = new Map();
+    for (const t in idx) {
+      const arr = idx[t];
+      const w = 1 / Math.log2(1 + tagCount[t]);
+      for (let a = 0; a < arr.length; a++) {
+        for (let b = a + 1; b < arr.length; b++) {
+          const k = arr[a] + "|" + arr[b];
+          score.set(k, (score.get(k) || 0) + w);
+        }
+      }
+    }
+
+    // 노드별 후보 정렬 → 상위 EDGES_PER_NODE개 유지
+    const byNode = Array.from({ length: nodes.length }, () => []);
+    score.forEach((s, k) => {
+      const sp = k.indexOf("|");
+      const a = +k.slice(0, sp), b = +k.slice(sp + 1);
+      byNode[a].push([b, s]);
+      byNode[b].push([a, s]);
+    });
+
+    const chosen = new Set();
+    const edges = [];
+    byNode.forEach((cands, i) => {
+      cands.sort((p, q) => q[1] - p[1]);
+      let added = 0;
+      for (const [j, s] of cands) {
+        if (added >= EDGES_PER_NODE) break;
+        const k = i < j ? i + "|" + j : j + "|" + i;
+        if (chosen.has(k)) { added++; continue; }
+        chosen.add(k);
+        edges.push({ source: nodes[i].id, target: nodes[j].id, score: s });
+        added++;
+      }
+    });
+
+    // 고립 노드 fallback: 흔한 태그까지 포함해 가장 유사한 글 1개와 연결
+    const connected = new Set();
+    edges.forEach((e) => { connected.add(e.source); connected.add(e.target); });
+    const fullIdx = {};
+    nodes.forEach((n, i) => {
+      n.tags.forEach((t) => {
+        if (tagCount[t] >= 2) (fullIdx[t] = fullIdx[t] || []).push(i);
+      });
+    });
+    nodes.forEach((n, i) => {
+      if (connected.has(n.id)) return;
+      const cand = new Map();
+      n.tags.forEach((t) => {
+        const arr = fullIdx[t];
+        if (!arr) return;
+        const w = 1 / Math.log2(1 + tagCount[t]);
+        arr.forEach((j) => { if (j !== i) cand.set(j, (cand.get(j) || 0) + w); });
+      });
+      let best = -1, bestS = 0;
+      cand.forEach((s, j) => { if (s > bestS) { bestS = s; best = j; } });
+      if (best >= 0) {
+        edges.push({ source: n.id, target: nodes[best].id, score: bestS });
+        connected.add(n.id);
+      }
+    });
+
+    // 인접 맵 (하이라이트용)
+    const adj = new Map();
+    edges.forEach((e) => {
+      if (!adj.has(e.source)) adj.set(e.source, new Set());
+      if (!adj.has(e.target)) adj.set(e.target, new Set());
+      adj.get(e.source).add(e.target);
+      adj.get(e.target).add(e.source);
+    });
+    state.adjacency = adj;
+    state.edges = edges;
   }
 
   /* ------------------------------ Scales ------------------------------ */
 
   function radiusScale(bodyLen) {
     const maxLen = state.maxBodyLen || 300;
-    const r = 5 + Math.sqrt(Math.max(bodyLen, 0) / maxLen) * 17;
-    return Math.max(5, Math.min(22, r));
+    const r = 8 + Math.sqrt(Math.max(bodyLen, 0) / maxLen) * 22;
+    return Math.max(8, Math.min(30, r));
   }
 
   /* ------------------------------ Map rendering (D3) ------------------------------ */
 
   function initMap() {
     svg = d3.select("#map-svg");
-    const viewBox = `0 0 ${WORLD_W} ${WORLD_H}`;
-    svg.attr("viewBox", viewBox).attr("preserveAspectRatio", "xMidYMid meet");
+    svg.attr("viewBox", `0 0 ${WORLD_W} ${WORLD_H}`).attr("preserveAspectRatio", "xMidYMid meet");
 
     zoomLayer = svg.append("g").attr("class", "zoom-layer");
+    linksLayer = zoomLayer.append("g").attr("class", "links-layer");
     nodesLayer = zoomLayer.append("g").attr("class", "nodes-layer");
 
     zoomBehavior = d3.zoom()
-      .scaleExtent([0.25, 14])
-      .on("zoom", onZoom)
-      .on("end", onZoomEnd);
+      .scaleExtent([0.2, 14])
+      .on("zoom", onZoom);
     svg.call(zoomBehavior);
 
     state.currentTransform = d3.zoomIdentity;
 
-    // initial gentle zoom-out so the whole cluster grid is visible
-    const initialScale = 0.62;
+    const w = svg.node().clientWidth || 1000;
+    const h = svg.node().clientHeight || 700;
+    const initialScale = Math.min(w / WORLD_W, h / WORLD_H) * 1.35;
     const initialTransform = d3.zoomIdentity
-      .translate(
-        (svg.node().clientWidth || 1000) / 2 - (WORLD_W / 2) * initialScale,
-        (svg.node().clientHeight || 700) / 2 - (WORLD_H / 2) * initialScale
-      )
+      .translate(w / 2 - (WORLD_W / 2) * initialScale, h / 2 - (WORLD_H / 2) * initialScale)
       .scale(initialScale);
     svg.call(zoomBehavior.transform, initialTransform);
 
@@ -308,38 +382,14 @@
       .on("drag", dragged)
       .on("end", dragEnded);
 
-    // event delegation: hover tooltip + click select + dblclick zoom
     svg.on("pointermove", onPointerMove);
-    svg.on("pointerleave", hideTooltip);
+    svg.on("pointerleave", () => { hideTooltip(); clearHover(); });
     svg.on("click", onSvgClick);
   }
 
   function onZoom(event) {
     state.currentTransform = event.transform;
     zoomLayer.attr("transform", event.transform);
-    updateClusterForces(event.transform.k);
-  }
-
-  function onZoomEnd() {
-    if (simulation) simulation.alphaTarget(0);
-  }
-
-  let lastZoomLevel = -1;
-  function updateClusterForces(k) {
-    if (!simulation) return;
-    const bucket = k < 1 ? 0 : k < 2.2 ? 1 : k < 4.5 ? 2 : 3;
-    if (bucket === lastZoomLevel) return;
-    lastZoomLevel = bucket;
-    const strengths = [0.24, 0.13, 0.05, 0.015];
-    const collidePad = [1, 3, 7, 12];
-    const chargeVal = [-6, -10, -18, -30];
-    simulation.force("x").strength(strengths[bucket]);
-    simulation.force("y").strength(strengths[bucket]);
-    simulation.force("collide").radius((d) => radiusScale(d.bodyLen) + collidePad[bucket]);
-    simulation.force("charge").strength(chargeVal[bucket]);
-    simulation.alphaTarget(0.25).restart();
-    clearTimeout(updateClusterForces._t);
-    updateClusterForces._t = setTimeout(() => simulation.alphaTarget(0), 600);
   }
 
   function dragStarted(event, d) {
@@ -360,13 +410,32 @@
 
   function buildSimulation() {
     simulation = d3.forceSimulation(state.nodes)
-      .force("x", d3.forceX((d) => (state.anchors[d.month] || { x: WORLD_W / 2 }).x).strength(0.24))
-      .force("y", d3.forceY((d) => (state.anchors[d.month] || { y: WORLD_H / 2 }).y).strength(0.24))
-      .force("charge", d3.forceManyBody().strength(-6))
-      .force("collide", d3.forceCollide((d) => radiusScale(d.bodyLen) + 1).strength(0.85))
+      .force("link", d3.forceLink(state.edges)
+        .id((d) => d.id)
+        .distance((e) => 60 + radiusScale(e.source.bodyLen) + radiusScale(e.target.bodyLen))
+        .strength((e) => Math.min(0.65, 0.22 + e.score * 0.12)))
+      .force("charge", d3.forceManyBody().strength(-90).distanceMax(560))
+      .force("x", d3.forceX(WORLD_W / 2).strength(0.05))
+      .force("y", d3.forceY(WORLD_H / 2).strength(0.075))
+      .force("collide", d3.forceCollide((d) => radiusScale(d.bodyLen) + 3.5).strength(0.85))
+      .velocityDecay(0.32)
       .alpha(1)
-      .alphaDecay(0.02)
+      .alphaDecay(0.016)
       .on("tick", ticked);
+
+    // 은은한 상시 움직임: 주기적으로 살짝 데워서 네트워크가 계속 살아 움직이게
+    setInterval(() => {
+      if (document.hidden || !simulation) return;
+      simulation.alphaTarget(0.018).restart();
+      setTimeout(() => simulation && simulation.alphaTarget(0), 1600);
+    }, 5200);
+  }
+
+  function renderLinks() {
+    linkSel = linksLayer.selectAll("line.link")
+      .data(state.edges)
+      .join("line")
+      .attr("class", "link");
   }
 
   function renderNodes() {
@@ -377,40 +446,98 @@
       .attr("data-id", (d) => d.id)
       .call(dragBehavior);
 
-    enter.append("circle").attr("class", "node-circle");
-    enter.append("text").attr("class", "node-icon").text((d) => TYPE_ICON[d.typeIcon] || "📝");
+    // 클립패스 (점 속 사진을 원형으로)
+    enter.append("clipPath")
+      .attr("id", (d) => `clip-${d.id}`)
+      .append("circle")
+      .attr("r", (d) => radiusScale(d.bodyLen));
 
-    const merged = enter.merge(sel);
-    merged.select("circle.node-circle")
+    // 베이스 원 (카테고리 색 — 이미지 로드 전/실패 시 표시)
+    enter.append("circle")
+      .attr("class", "node-circle")
       .attr("r", (d) => radiusScale(d.bodyLen))
       .attr("fill", (d) => CATEGORY_COLORS[d.category] || CATEGORY_COLORS["기타"]);
-    merged.select("text.node-icon")
-      .text((d) => TYPE_ICON[d.typeIcon] || "📝")
-      .style("display", (d) => (radiusScale(d.bodyLen) < 8 ? "none" : null));
+
+    // 대표 사진
+    enter.filter((d) => !!d.img)
+      .append("image")
+      .attr("class", "node-img")
+      .attr("clip-path", (d) => `url(#clip-${d.id})`)
+      .attr("x", (d) => -radiusScale(d.bodyLen))
+      .attr("y", (d) => -radiusScale(d.bodyLen))
+      .attr("width", (d) => radiusScale(d.bodyLen) * 2)
+      .attr("height", (d) => radiusScale(d.bodyLen) * 2)
+      .attr("preserveAspectRatio", "xMidYMid slice")
+      .attr("href", (d) => thumbUrl(d.img, 120))
+      .on("error", function (event, d) {
+        const img = d3.select(this);
+        if (!img.attr("data-fallback")) {
+          img.attr("data-fallback", "1").attr("href", d.img); // 원본으로 재시도
+        } else {
+          img.remove(); // 색상 원만 표시
+        }
+      });
+
+    // 카테고리 링
+    enter.append("circle")
+      .attr("class", "node-ring")
+      .attr("r", (d) => radiusScale(d.bodyLen))
+      .attr("fill", "none")
+      .attr("stroke", (d) => CATEGORY_COLORS[d.category] || CATEGORY_COLORS["기타"]);
+
+    sel.exit().remove();
   }
 
   function ticked() {
     nodesLayer.selectAll("g.node-group")
       .attr("transform", (d) => `translate(${d.x},${d.y})`);
+    if (linkSel) {
+      linkSel
+        .attr("x1", (d) => d.source.x)
+        .attr("y1", (d) => d.source.y)
+        .attr("x2", (d) => d.target.x)
+        .attr("y2", (d) => d.target.y);
+    }
   }
 
-  /* ------------------------------ Tooltip ------------------------------ */
+  /* ------------------------------ Hover: tooltip + 이웃 하이라이트 ------------------------------ */
 
   function onPointerMove(event) {
     const target = event.target.closest(".node-group");
-    if (!target) { hideTooltip(); return; }
+    if (!target) { hideTooltip(); clearHover(); return; }
     const id = target.getAttribute("data-id");
     const d = state.nodeById.get(id);
-    if (!d) { hideTooltip(); return; }
+    if (!d) { hideTooltip(); clearHover(); return; }
     showTooltip(event, d);
+    if (state.hoverId !== id) setHover(id);
+  }
+
+  function setHover(id) {
+    state.hoverId = id;
+    const neighbors = state.adjacency.get(id) || new Set();
+    nodesLayer.selectAll("g.node-group")
+      .classed("is-hover", (d) => d.id === id)
+      .classed("is-neighbor", (d) => neighbors.has(d.id));
+    if (linkSel) {
+      linkSel.classed("hl", (e) => e.source.id === id || e.target.id === id);
+    }
+  }
+
+  function clearHover() {
+    if (!state.hoverId) return;
+    state.hoverId = null;
+    nodesLayer.selectAll("g.node-group").classed("is-hover", false).classed("is-neighbor", false);
+    if (linkSel) linkSel.classed("hl", false);
   }
 
   function showTooltip(event, d) {
     const tt = el.tooltip();
+    const nTags = (d.tags || []).slice(0, 4).map((t) => "#" + escapeHtml(t)).join(" ");
     tt.innerHTML = `
       <div class="bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-lg leading-snug">
         <div class="font-semibold mb-0.5 line-clamp-2">${escapeHtml(d.title)}</div>
         <div class="text-gray-300">${escapeHtml(d.date)} · ${escapeHtml(d.author)} · ${escapeHtml(d.category)}</div>
+        ${nTags ? `<div class="text-gray-400 mt-0.5">${nTags}</div>` : ""}
       </div>`;
     tt.style.left = event.clientX + "px";
     tt.style.top = event.clientY + "px";
@@ -450,18 +577,6 @@
     svg.transition().duration(600).call(zoomBehavior.transform, transform);
   }
 
-  function focusMonth(month) {
-    const anchor = state.anchors[month];
-    if (!anchor || !svg) return;
-    const targetScale = 1.5;
-    const w = svg.node().clientWidth || 1000;
-    const h = svg.node().clientHeight || 700;
-    const transform = d3.zoomIdentity
-      .translate(w / 2 - anchor.x * targetScale, h / 2 - anchor.y * targetScale)
-      .scale(targetScale);
-    svg.transition().duration(600).call(zoomBehavior.transform, transform);
-  }
-
   /* ------------------------------ Detail panel ------------------------------ */
 
   async function ensurePosts() {
@@ -470,7 +585,6 @@
       state.postsPromise = fetchJson("posts.json").then((arr) => {
         enrichNodesWithPosts(arr);
         state.postsLoaded = true;
-        renderNodes();
         updatePostsStatus(true);
         applyFilters();
         return state.postsCache;
@@ -692,11 +806,20 @@
       .classed("is-match", (d) => hasActiveFilters && d._match && q)
       .classed("is-hidden", false);
 
+    // 링크도 함께 흐리게: 양 끝이 모두 매칭될 때만 강조 유지
+    if (linkSel) {
+      linkSel.classed("is-dim", (e) => {
+        if (!hasActiveFilters) return false;
+        const s = typeof e.source === "object" ? e.source : state.nodeById.get(e.source);
+        const t = typeof e.target === "object" ? e.target : state.nodeById.get(e.target);
+        return !(s && t && s._match && t._match);
+      });
+    }
+
     el.resultCount().textContent = hasActiveFilters
       ? `${matchCount} / ${state.nodes.length}건 매칭`
       : `총 ${state.nodes.length}건`;
 
-    // rebuild list view with matched (or all) nodes
     state.listItems = hasActiveFilters ? matchedNodes : state.nodes.slice();
     state.listItems.sort((a, b) => (a.date < b.date ? 1 : -1));
     resetListView();
@@ -704,6 +827,7 @@
     if (q && matchedNodes.length) {
       fitToNodes(matchedNodes);
     }
+    return matchedNodes;
   }
 
   function fitToNodes(nodesArr) {
@@ -716,7 +840,7 @@
     const h = svg.node().clientHeight || 700;
     const bw = Math.max(maxX - minX, 60);
     const bh = Math.max(maxY - minY, 60);
-    const scale = Math.min(6, Math.max(0.4, Math.min(w / (bw + 160), h / (bh + 160))));
+    const scale = Math.min(6, Math.max(0.35, Math.min(w / (bw + 160), h / (bh + 160))));
     const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
     const transform = d3.zoomIdentity
       .translate(w / 2 - cx * scale, h / 2 - cy * scale)
@@ -735,7 +859,6 @@
     `).join("") + `
       <button type="button" id="month-chip-all" class="month-chip active flex-shrink-0 border border-gray-900 rounded-full px-3 py-1.5 text-xs font-medium bg-gray-900 text-white">전체</button>
     `;
-    // move "전체" to front
     wrap.prepend(document.getElementById("month-chip-all"));
 
     wrap.addEventListener("click", (e) => {
@@ -745,17 +868,10 @@
       btn.classList.add("active");
       const m = btn.getAttribute("data-month");
       state.filters.months.clear();
-      if (m) {
-        state.filters.months.add(m);
-        focusMonth(m);
-      }
-      applyFilters();
-      syncYearMonthUI();
+      if (m) state.filters.months.add(m);
+      const matched = applyFilters();
+      if (m && matched.length) fitToNodes(matched);
     });
-  }
-
-  function syncYearMonthUI() {
-    // no-op placeholder for potential future sync (year select stays independent)
   }
 
   /* ------------------------------ Filter panel wiring ------------------------------ */
@@ -878,8 +994,11 @@
       div.className = "list-item px-3 py-2.5 border-b border-gray-100 flex items-start gap-2.5" +
         (d.id === state.selectedId ? " is-selected" : "");
       div.dataset.id = d.id;
+      const thumb = d.img
+        ? `<img src="${escapeHtml(thumbUrl(d.img, 64))}" loading="lazy" class="w-9 h-9 rounded-full object-cover shrink-0 border" style="border-color:${CATEGORY_COLORS[d.category] || "#9ca3af"}" onerror="this.style.display='none'">`
+        : `<span class="inline-block w-2.5 h-2.5 rounded-full mt-1 shrink-0" style="background:${CATEGORY_COLORS[d.category] || "#9ca3af"}"></span>`;
       div.innerHTML = `
-        <span class="inline-block w-2.5 h-2.5 rounded-full mt-1 shrink-0" style="background:${CATEGORY_COLORS[d.category] || "#9ca3af"}"></span>
+        ${thumb}
         <div class="min-w-0">
           <div class="text-sm text-gray-800 clamp-2 leading-snug">${escapeHtml(d.title)}</div>
           <div class="text-[11px] text-gray-400 mt-0.5">${escapeHtml(d.date)} · ${escapeHtml(d.author)} · ${escapeHtml(d.category)}</div>
@@ -943,21 +1062,23 @@
 
   async function init() {
     try {
-      const [searchIndex, months, tags] = await Promise.all([
+      const [searchIndex, months, tags, thumbs] = await Promise.all([
         fetchJson("search-index.json"),
         fetchJson("months.json"),
         fetchJson("tags.json"),
+        fetchJson("thumbs.json"),
       ]);
       state.monthsMeta = months;
       state.tagsMeta = tags;
       state.nodes = buildNodesFromSearchIndex(searchIndex);
       state.nodes.forEach((n) => state.nodeById.set(n.id, n));
-      state.anchors = computeAnchors(months._sorted_months);
+      applyThumbs(thumbs);
+      buildEdges();
 
       initMap();
       buildSimulation();
+      renderLinks();
       renderNodes();
-      updateClusterForces(0.62);
 
       renderMonthChips();
       renderYearOptions();
@@ -976,7 +1097,6 @@
       lucide.createIcons();
       $("#loading-overlay").classList.add("hidden");
 
-      // background load of full posts.json for enrichment + detail panel
       ensurePosts().catch(() => {});
     } catch (err) {
       console.error(err);
