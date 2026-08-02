@@ -356,7 +356,7 @@
 
   function initMap() {
     svg = d3.select("#map-svg");
-    svg.attr("viewBox", `0 0 ${WORLD_W} ${WORLD_H}`).attr("preserveAspectRatio", "xMidYMid meet");
+    // viewBox 사용 안 함: zoom transform이 픽셀 좌표계에서 world를 직접 매핑
 
     zoomLayer = svg.append("g").attr("class", "zoom-layer");
     linksLayer = zoomLayer.append("g").attr("class", "links-layer");
@@ -371,7 +371,7 @@
 
     const w = svg.node().clientWidth || 1000;
     const h = svg.node().clientHeight || 700;
-    const initialScale = Math.min(w / WORLD_W, h / WORLD_H) * 1.35;
+    const initialScale = Math.min(w / WORLD_W, h / WORLD_H) * 1.6;
     const initialTransform = d3.zoomIdentity
       .translate(w / 2 - (WORLD_W / 2) * initialScale, h / 2 - (WORLD_H / 2) * initialScale)
       .scale(initialScale);
